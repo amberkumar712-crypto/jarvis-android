@@ -1,20 +1,25 @@
 package com.jarvis.ai
 
+import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.Dialog
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.hardware.camera2.CameraManager
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Bundle
 import android.provider.AlarmClock
+import android.provider.ContactsContract
 import android.provider.MediaStore
 import android.provider.Settings
 import android.speech.RecognizerIntent
 import android.speech.tts.TextToSpeech
 import android.view.Gravity
 import android.view.View
+import android.webkit.WebView
 import android.widget.*
 import org.json.JSONArray
 import org.json.JSONObject
@@ -29,6 +34,7 @@ class MainActivity : Activity() {
     private var tts: TextToSpeech? = null
     private val hist = JSONArray()
     private var lang = Locale("en", "IN")
+    private var pendingPerm: (() -> Unit)? = null
     private val prefs by lazy { getSharedPreferences("j", MODE_PRIVATE) }
     private val base get() = prefs.getString("url", "http://127.0.0.1:8000")!!
 
@@ -66,7 +72,7 @@ class MainActivity : Activity() {
         row.addView(btn("➤") { handle(input.text.toString()) })
         root.addView(row)
         setContentView(root)
-        add("Online. Try: “open YouTube”, “alarm 6:30 am”, “torch on”, “volume up”, “call 9876543210”, or ask anything.")
+        add("Online. Try: “WhatsApp Rahul ko bolo ki main late hoon”, “play Kesariya”, “let’s play 20 questions”, “make a snake game”, “make a multiplayer tic tac toe game”, “write python code for a calculator”, “torch on”, “alarm 6:30 am”, “accessibility”.")
     }
 
     private fun btn(t: String, f: () -> Unit) = Button(this).apply {
@@ -78,6 +84,7 @@ class MainActivity : Activity() {
         val v = TextView(this).apply {
             text = t; textSize = 15f; setTextColor(Color.parseColor("#e0f2fe")); setPadding(24, 16, 24, 16)
             setBackgroundColor(Color.parseColor(if (user) "#1e3a8a" else "#0f1e3c"))
+            setTextIsSelectable(true)
         }
         log.addView(v, LinearLayout.LayoutParams(-2, -2).apply { topMargin = 12; gravity = if (user) Gravity.END else Gravity.START })
         scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
@@ -87,6 +94,7 @@ class MainActivity : Activity() {
     private fun speak(t: String) {
         tts?.speak(t.replace(Regex("[*#`]"), ""), TextToSpeech.QUEUE_FLUSH, null, "j")
     }
+    private fun say(t: String) { add(t); speak(t) }
 
     private fun settings() {
         val e = EditText(this).apply { setText(base) }
@@ -111,27 +119,51 @@ class MainActivity : Activity() {
             d?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()?.let { handle(it) }
     }
 
+    override fun onRequestPermissionsResult(rc: Int, p: Array<out String>, g: IntArray) {
+        super.onRequestPermissionsResult(rc, p, g)
+        if (rc == 2) {
+            if (g.isNotEmpty() && g[0] == PackageManager.PERMISSION_GRANTED) pendingPerm?.invoke()
+            else add("Contacts permission denied, so I can't look up names. Say a number instead: “WhatsApp 9876543210 hello”.")
+            pendingPerm = null
+        }
+    }
+
     private fun handle(t: String) {
         if (t.isBlank()) return
         tts?.stop(); add(t, true); input.setText("")
-        val r = local(t.lowercase().trim())
-        if (r != null) { add(r); speak(r); return }
+        val l = t.lowercase().trim()
+        val wa = Regex("whatsapp|व्हाट्सएप|व्हाट्सऐप|वॉट्सऐप").containsMatchIn(l) &&
+            Regex("message|msg|send|text|bhej|bolo|likh|कहो|भेज|बोल|लिख").containsMatchIn(l)
+        val game = Regex("game|गेम").containsMatchIn(l) && Regex("make|create|build|bana|बना").containsMatchIn(l)
+        if (wa) { whatsapp(t); return }
+        if (game) { makeGame(t); return }
+        val yt = Regex("\\b(play|bajao|chalao)\\b|बजाओ|चलाओ").containsMatchIn(l) &&
+            !Regex("game|गेम|with me|mere saath|मेरे साथ").containsMatchIn(l)
+        if (yt) { playYoutube(l); return }
+        val r = local(l)
+        if (r != null) { say(r); return }
         val w = add("…")
+        gemini(t, hist) { rep, err ->
+            if (rep == null) { w.text = "Error: $err\nIs the server running? Check ⚙ for the URL."; return@gemini }
+            hist.put(JSONObject().put("role", "user").put("text", t))
+            hist.put(JSONObject().put("role", "model").put("text", rep))
+            w.text = rep
+            speak(if (rep.contains("```")) "Code is ready on screen. Long-press to copy." else rep)
+        }
+    }
+
+    private fun gemini(msg: String, history: JSONArray = JSONArray(), cb: (String?, String?) -> Unit) {
         Thread {
             try {
-                val rep = post("/api/chat", JSONObject().put("history", hist).put("message", t)).getString("reply")
-                hist.put(JSONObject().put("role", "user").put("text", t))
-                hist.put(JSONObject().put("role", "model").put("text", rep))
-                runOnUiThread { w.text = rep; speak(rep) }
-            } catch (e: Exception) {
-                runOnUiThread { w.text = "Error: ${e.message}\nIs the server running? Check ⚙ for the URL." }
-            }
+                val r = post("/api/chat", JSONObject().put("history", history).put("message", msg)).getString("reply")
+                runOnUiThread { cb(r, null) }
+            } catch (e: Exception) { runOnUiThread { cb(null, e.message) } }
         }.start()
     }
 
     private fun post(path: String, body: JSONObject): JSONObject {
         val c = URL(base + path).openConnection() as HttpURLConnection
-        c.requestMethod = "POST"; c.doOutput = true; c.readTimeout = 90000
+        c.requestMethod = "POST"; c.doOutput = true; c.readTimeout = 120000
         c.setRequestProperty("Content-Type", "application/json")
         c.outputStream.write(body.toString().toByteArray())
         val code = c.responseCode
@@ -140,9 +172,127 @@ class MainActivity : Activity() {
         return JSONObject(s)
     }
 
-    // Device actions: only what Android allows without special access. Returns null if not a device command.
+
+    // ---------- YouTube: finds the first matching video and opens it ----------
+    private fun playYoutube(l: String) {
+        val q = l.replace(Regex("\\b(open|launch|youtube|and|on|play|bajao|chalao|video|song)\\b|बजाओ|चलाओ|गाना|वीडियो"), " ")
+            .replace(Regex("\\s+"), " ").trim()
+        if (q.isEmpty()) { say("Tell me what to play, e.g. “play Kesariya”."); return }
+        val w = add("Finding “$q” on YouTube…")
+        Thread {
+            var id: String? = null
+            try {
+                val c = URL("https://www.youtube.com/results?search_query=" + Uri.encode(q) + "&hl=en").openConnection() as HttpURLConnection
+                c.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36")
+                c.setRequestProperty("Accept-Language", "en-US,en;q=0.9")
+                c.setRequestProperty("Cookie", "CONSENT=YES+1; SOCS=CAI")
+                c.connectTimeout = 10000; c.readTimeout = 15000
+                val html = c.inputStream.bufferedReader().readText()
+                id = Regex("\"videoId\":\"([A-Za-z0-9_-]{11})\"").find(html)?.groupValues?.get(1)
+            } catch (e: Exception) {}
+            runOnUiThread {
+                try {
+                    if (id != null) {
+                        w.text = "Playing “$q” on YouTube."
+                        try { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("vnd.youtube:$id"))) }
+                        catch (e: Exception) { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com/watch?v=$id"))) }
+                    } else {
+                        w.text = "Couldn't pick a video automatically. Opening search results."
+                        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com/results?search_query=" + Uri.encode(q))))
+                    }
+                } catch (e: Exception) { w.text = "Couldn't open YouTube: ${e.message}" }
+            }
+        }.start()
+    }
+
+    // ---------- WhatsApp (always asks you to confirm) ----------
+    private fun whatsapp(t: String) {
+        val w = add("Understanding…")
+        val p = "Extract the WhatsApp recipient and message from this request. Reply ONLY with JSON like " +
+            "{\"name\":\"...\",\"message\":\"...\"}. Write the name in English letters. Write the message in first person, " +
+            "in the same language the user spoke. Request: $t"
+        gemini(p) { r, err ->
+            if (r == null) { w.text = "Error: $err"; return@gemini }
+            try {
+                val j = JSONObject(r.substring(r.indexOf('{'), r.lastIndexOf('}') + 1))
+                val name = j.getString("name"); val msg = j.getString("message")
+                w.text = "To: $name\nMessage: $msg"
+                withContacts { sendWa(name, msg) }
+            } catch (ex: Exception) {
+                w.text = "I couldn't understand that. Try: “WhatsApp Rahul ko bolo ki main late hoon”."
+            }
+        }
+    }
+
+    private fun withContacts(f: () -> Unit) {
+        if (checkSelfPermission(Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED) f()
+        else { pendingPerm = f; requestPermissions(arrayOf(Manifest.permission.READ_CONTACTS), 2) }
+    }
+
+    private fun findContact(name: String): String? {
+        contentResolver.query(ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+            arrayOf(ContactsContract.CommonDataKinds.Phone.NUMBER),
+            ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " LIKE ?", arrayOf("%$name%"), null)?.use {
+            if (it.moveToFirst()) return it.getString(0).filter { c -> c.isDigit() }
+        }
+        return null
+    }
+
+    private fun sendWa(name: String, msg: String) {
+        val digits = name.filter { it.isDigit() }
+        val found = if (digits.length >= 8) digits else findContact(name)
+        if (found == null) { say("I couldn't find “$name” in your contacts."); return }
+        val n = if (found.length == 10) "91$found" else found
+        AlertDialog.Builder(this).setTitle("Send WhatsApp?").setMessage("To: $name (+$n)\n\n$msg")
+            .setPositiveButton("Send") { _, _ ->
+                JarvisService.arm()
+                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://wa.me/$n?text=" + Uri.encode(msg))))
+                if (!JarvisService.running) add("WhatsApp opened with your message. Tap send. (Say “accessibility” to enable auto-send.)")
+            }.setNegativeButton("Cancel", null).show()
+    }
+
+    // ---------- Games (Gemini writes an HTML game, runs it in a WebView) ----------
+    private fun makeGame(t: String) {
+        val multi = Regex("multiplayer|multi player|dost|friend|दोस्त|online").containsMatchIn(t.lowercase())
+        val ws = base.replaceFirst("http", "ws") + "/ws/"
+        var p = "Create this as ONE complete self-contained HTML file (inline CSS and JS, no external files or libraries): $t. " +
+            "Mobile-first with touch controls, dark neon style, responsive full-screen, with score and a restart button. " +
+            "Reply with only the code in a single ```html block."
+        if (multi) p += " It is an online multiplayer game. The page first asks for a room code, then connects with " +
+            "new WebSocket(\"$ws\" + roomCode). The server relays every message you send to the other players in the room. " +
+            "On connect it sends you {\"_role\":N,\"_count\":N} (N is your player number) and sends others {\"_join\":N} when someone joins. " +
+            "Send small JSON messages (moves/state) and keep both screens in sync. Player 1 is the host."
+        val w = add("Building your game… (up to a minute)")
+        gemini(p) { r, err ->
+            if (r == null) { w.text = "Error: $err"; return@gemini }
+            val m = Regex("```(?:html)?\\s*([\\s\\S]*?)```").find(r)
+            val html = m?.groupValues?.get(1) ?: (if (r.contains("<html", true)) r else null)
+            if (html == null) { w.text = "I couldn't build it. Try again with a simpler description."; return@gemini }
+            w.text = if (multi) "Game ready. Both players need the same room code, and the same server (see ⚙)." else "Game ready!"
+            showGame(html)
+        }
+    }
+
+    private fun showGame(html: String) {
+        val d = Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(Color.BLACK); setPadding(0, 48, 0, 0) }
+        val wv = WebView(this)
+        wv.settings.javaScriptEnabled = true
+        wv.settings.domStorageEnabled = true
+        wv.settings.mediaPlaybackRequiresUserGesture = false
+        col.addView(btn("✕ Close") { d.dismiss(); wv.destroy() })
+        col.addView(wv, LinearLayout.LayoutParams(-1, 0, 1f))
+        d.setContentView(col); d.show()
+        wv.loadDataWithBaseURL("http://localhost/", html, "text/html", "utf-8", null)
+    }
+
+    // ---------- Device actions (only what Android allows) ----------
     private fun local(t: String): String? = try {
         when {
+            t.contains("accessibility") || t.contains("एक्सेसिबिलिटी") -> {
+                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                "Find JARVIS in the list and turn it on. If it's greyed out: Settings > Apps > JARVIS > ⋮ > Allow restricted settings."
+            }
             Regex("torch|flashlight|टॉर्च").containsMatchIn(t) -> {
                 val on = !Regex("\\boff\\b|band|बंद").containsMatchIn(t)
                 val cm = getSystemService(CAMERA_SERVICE) as CameraManager
@@ -153,6 +303,15 @@ class MainActivity : Activity() {
                 (getSystemService(AUDIO_SERVICE) as AudioManager).adjustStreamVolume(AudioManager.STREAM_MUSIC,
                     if (up) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI)
                 "Volume ${if (up) "up" else "down"}."
+            }
+            t.contains("timer") -> {
+                val m = Regex("(\\d+)").find(t)
+                if (m == null) "Tell me how long, e.g. “timer 10 minutes”." else {
+                    val mins = m.value.toInt()
+                    startActivity(Intent(AlarmClock.ACTION_SET_TIMER).putExtra(AlarmClock.EXTRA_LENGTH, mins * 60)
+                        .putExtra(AlarmClock.EXTRA_SKIP_UI, true))
+                    "Timer set for $mins minutes."
+                }
             }
             t.contains("alarm") -> {
                 val m = Regex("(\\d{1,2})(?:[:.](\\d{2}))?\\s*(am|pm)?").find(t)
